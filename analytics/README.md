@@ -57,3 +57,225 @@ the full write-up: missing-value percentages, IQR outlier counts, skewness concl
 survival-rate breakdowns, correlation interpretation, all 4 chart interpretations, the
 imbalance-strategy conclusion, GridSearchCV best params + OOB score, regression metrics
 and heteroscedasticity conclusion, and the final model comparison table with recommendation.
+
+## Code Walkthrough: `01_eda.py` (key logic, annotated)
+
+```python
+df = sns.load_dataset("titanic")
+df.to_csv("titanic.csv", index=False)
+# ^ THE ONE AND ONLY network/cache load of the raw dataset, per the spec.
+#   Saved to CSV immediately, BEFORE any cleaning — this is the raw
+#   "offline fallback" that 02_modeling.py will read from later, so the
+#   raw dataset never needs to be loaded a second time.
+
+missing_pct = (df.isna().mean() * 100).round(2)
+# ^ .isna() -> True/False per cell. .mean() on True/False treats True as 1,
+#   False as 0, so the column mean IS the fraction missing. *100 -> percent.
+missing_pct = missing_pct[missing_pct > 0].sort_values(ascending=False)
+# ^ Keep only columns with at least some missing data, worst first.
+
+df_clean = df.copy()
+for col, pct in missing_pct.items():
+    if col == "deck":
+        continue  # handled separately below — its rate is too high to impute
+    if pct < 5:
+        before = len(df_clean)
+        df_clean = df_clean.dropna(subset=[col])
+        # ^ dropna(subset=[col]) removes only ROWS where THIS column is
+        #   missing — not rows missing in some other column.
+    elif pct <= 30:
+        if pd.api.types.is_numeric_dtype(df_clean[col]):
+            fill_value = df_clean[col].median()
+            df_clean[col] = df_clean[col].fillna(fill_value)
+            # ^ Median, not mean, because it's not skewed by outliers.
+        else:
+            fill_value = df_clean[col].mode()[0]
+            # ^ For a text/categorical column, "average" doesn't make sense —
+            #   use the MOST COMMON value instead. .mode() can return
+            #   multiple values if tied, so [0] picks the first.
+            df_clean[col] = df_clean[col].fillna(fill_value)
+
+if "deck" in missing_pct.index:
+    df_clean = df_clean.drop(columns=["deck"])
+    # ^ ~77% missing — imputing would mean INVENTING a value for most rows.
+    #   Dropping the whole column is more honest than fabricating data.
+
+
+def iqr_outliers(series: pd.Series) -> tuple[int, float, float]:
+    q1, q3 = series.quantile(0.25), series.quantile(0.75)
+    # ^ Q1 = value below which 25% of data falls; Q3 = below which 75% falls.
+    iqr = q3 - q1
+    lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+    # ^ The standard "1.5 x IQR" rule for defining outlier boundaries.
+    outliers = series[(series < lower) | (series > upper)]
+    return len(outliers), lower, upper
+
+
+fare_mean = df_clean["fare"].mean()
+fare_median = df_clean["fare"].median()
+fare_mode = df_clean["fare"].mode()[0]
+
+if fare_mean > fare_median > fare_mode:
+    skew_conclusion = f"...right-skewed..."
+elif fare_mean < fare_median < fare_mode:
+    skew_conclusion = f"...left-skewed..."
+else:
+    skew_conclusion = f"...approximately symmetric..."
+# ^ IMPORTANT: this isn't a hardcoded guess — it's an if/elif/else that
+#   reads whatever the REAL computed mean/median/mode turn out to be and
+#   picks the correct conclusion automatically. Whoever runs this script
+#   gets a genuinely accurate sentence, not one I wrote in advance.
+
+corr_cols = ["survived", "pclass", "age", "sibsp", "parch", "fare"]
+corr_matrix = df_clean[corr_cols].corr()
+# ^ .corr() computes every pairwise correlation between these 6 columns
+#   at once, producing a 6x6 table (a "correlation matrix").
+
+pairs = []
+for i, c1 in enumerate(corr_cols):
+    for c2 in corr_cols[i + 1:]:
+        # ^ corr_cols[i+1:] — only look at columns AFTER c1 in the list.
+        #   This avoids comparing a column to itself, and avoids counting
+        #   (age, fare) AND (fare, age) as two separate "different" pairs.
+        pairs.append((c1, c2, corr_matrix.loc[c1, c2]))
+pairs.sort(key=lambda p: abs(p[2]), reverse=True)
+# ^ Sort all pairs by the SIZE of their correlation (ignoring +/- sign,
+#   via abs()), strongest first.
+top2 = pairs[:2]
+# ^ The two strongest relationships, whatever they turn out to be.
+
+scaler = StandardScaler()
+scaled = scaler.fit_transform(df_clean[["age", "fare"]])
+# ^ fit_transform: LEARNS the mean/std from this data, then immediately
+#   applies the z-score formula (x - mean) / std using those learned values.
+#   This is an EDA-only sanity check — 02_modeling.py does its OWN
+#   separate scaling, fit on the training split only, to avoid leakage.
+```
+
+## Code Walkthrough: `02_modeling.py` (key logic, annotated)
+
+```python
+df = pd.read_csv("titanic.csv")
+# ^ Reads the SAME raw CSV 01_eda.py saved — this is a continuation of
+#   that one load, not a second network call.
+
+X = df[FEATURES]   # the columns we'll use to PREDICT with
+y = df[TARGET]     # "survived" — the thing we're trying to predict
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+# ^ stratify=y: forces both X_train/y_train and X_test/y_test to have the
+#   SAME proportion of survived=1 vs survived=0 as the full dataset —
+#   without this, a random split could accidentally put too many/few
+#   survivors in one side, skewing evaluation.
+# ^ random_state=42: makes the "random" split reproducible — running this
+#   script twice gives the exact same split both times.
+# ^ THIS HAPPENS BEFORE ANY PREPROCESSING — critical for avoiding leakage.
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", Pipeline([("imputer", SimpleImputer(strategy="median")),
+                           ("scaler", StandardScaler())]), NUMERIC_FEATURES),
+        ("cat", Pipeline([("imputer", SimpleImputer(strategy="most_frequent")),
+                           ("onehot", OneHotEncoder(handle_unknown="ignore"))]), CATEGORICAL_FEATURES),
+    ]
+)
+# ^ ColumnTransformer applies DIFFERENT processing to different columns:
+#   numeric columns get median-filled + scaled; categorical columns get
+#   most-common-filled + one-hot encoded (turned into 0/1 columns per category).
+#   Bundling this in a Pipeline object means: when we later call
+#   pipeline.fit(X_train), this preprocessor LEARNS its median/mean/categories
+#   from X_train ONLY. When we call pipeline.predict(X_test), it just
+#   APPLIES those already-learned values — it never re-learns from test data.
+#   This structural separation is what prevents leakage, rather than us
+#   having to remember to do it correctly by hand every time.
+
+for name, clf in classifiers.items():
+    pipe = Pipeline([("preprocessor", preprocessor), ("classifier", clf)])
+    pipe.fit(X_train, y_train)
+    # ^ ONE call does both: fit the preprocessor on X_train, THEN fit the
+    #   classifier on the preprocessed result. All in the right order.
+
+    y_pred = pipe.predict(X_test)
+    y_proba = pipe.predict_proba(X_test)[:, 1]
+    # ^ predict() gives a hard 0/1 answer. predict_proba() gives the
+    #   underlying PROBABILITY of survival — [:, 1] takes the "probability
+    #   of class 1 (survived)" column, needed for the ROC/AUC calculation.
+
+# --- Imbalance comparison ---
+X_train_proc = preprocessor.fit_transform(X_train, y_train)
+X_test_proc = preprocessor.transform(X_test)
+# ^ Note: .fit_transform on train, .transform (NOT fit) on test — same
+#   leakage-avoidance rule, just done manually here since SMOTE needs
+#   already-numeric input rather than raw text/category columns.
+
+smote = SMOTE(random_state=42)
+X_train_smote, y_train_smote = smote.fit_resample(X_train_proc, y_train)
+# ^ SMOTE invents SYNTHETIC new minority-class rows (interpolated between
+#   real ones) so the training data has more balanced classes. Applied
+#   ONLY to X_train_proc — X_test_proc is never touched by SMOTE, since
+#   the test set must stay a realistic, untouched sample to evaluate against.
+
+# --- Hyperparameter tuning ---
+rf_pipe = Pipeline([("preprocessor", preprocessor),
+                     ("classifier", RandomForestClassifier(oob_score=True, random_state=42))])
+param_grid = {
+    "classifier__n_estimators": [100, 200, 300],
+    "classifier__max_depth": [None, 5, 10],
+    "classifier__max_features": ["sqrt", "log2"],
+}
+# ^ "classifier__n_estimators" (double underscore) tells GridSearchCV:
+#   "inside this pipeline, set the n_estimators parameter on the step
+#   named 'classifier'". This naming is how sklearn lets you tune
+#   parameters of a step buried inside a Pipeline.
+grid_search = GridSearchCV(rf_pipe, param_grid, cv=5, scoring="accuracy", n_jobs=-1)
+grid_search.fit(X_train, y_train)
+# ^ Tries every combination in param_grid (3 x 3 x 2 = 18 combinations),
+#   each evaluated with 5-fold cross-validation (cv=5) — splitting
+#   X_train itself into 5 pieces, training on 4 and validating on the
+#   5th, rotating which piece is held out, 5 times per combination.
+#   Because rf_pipe INCLUDES the preprocessor, each of those inner folds
+#   refits preprocessing on just that fold's training portion — so even
+#   this tuning step doesn't leak information across folds.
+
+best_rf_pipe = grid_search.best_estimator_
+oob = best_rf_pipe.named_steps["classifier"].oob_score_
+# ^ .named_steps["classifier"] reaches INTO the pipeline to grab the
+#   actual RandomForestClassifier object, so we can read its oob_score_
+#   attribute (only populated because we passed oob_score=True above).
+#   OOB = "out-of-bag": each tree in the forest is trained on a random
+#   subset of rows; the ROWS IT DIDN'T SEE act as a free built-in
+#   validation set, giving oob_score_ without needing a separate held-out set.
+
+# --- Regression side-task ---
+n, p = len(y_reg_test), len(REG_FEATURES)
+adj_r2 = 1 - (1 - r2) * (n - 1) / (n - p - 1)
+# ^ Plain R² can look artificially better just from adding MORE features,
+#   even useless ones. Adjusted R² penalizes for feature count (p) — a
+#   fairer comparison when models use different numbers of features.
+
+hetero_corr = np.corrcoef(y_reg_pred, np.abs(residuals))[0, 1]
+if abs(hetero_corr) > 0.2:
+    hetero_conclusion = "...heteroscedasticity..."
+else:
+    hetero_conclusion = "...roughly constant (homoscedastic)..."
+# ^ Heteroscedasticity = error size changes depending on the prediction
+#   value (e.g. bigger errors for expensive fares). We approximate this
+#   by checking: do bigger PREDICTIONS correlate with bigger ABSOLUTE
+#   ERRORS? A real correlation there suggests non-constant error spread.
+
+joblib.dump(best_rf_pipe, "model_pipeline.joblib")
+# ^ Saves preprocessing AND the trained model TOGETHER as one object.
+#   This matters: if we'd saved only the RandomForestClassifier, we'd
+#   also need to separately save and correctly re-apply the
+#   ColumnTransformer later — easy to get wrong. Saving the whole
+#   pipeline means loading it back gives you one object that goes
+#   straight from raw input to a prediction.
+
+reloaded = joblib.load("model_pipeline.joblib")
+original_pred = best_rf_pipe.predict(sample_raw)[0]
+reloaded_pred = reloaded.predict(sample_raw)[0]
+# ^ Proves the save/load round-trip actually works — the reloaded
+#   pipeline should predict IDENTICALLY to the original on the same input.
+```
