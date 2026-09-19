@@ -172,3 +172,286 @@ if __name__ == "__main__":
     df.to_csv("data/books_raw.csv", index=False)
 ```
 The `if __name__ == "__main__":` guard means: *"only run this when executing `python scraper.py` directly — not when another file imports functions from this one."*
+
+## Code Walkthrough: `clean.py` (fully annotated)
+
+```python
+"""Cleans raw scraped book data into properly typed columns."""
+import pandas as pd
+
+GBP_TO_INR_RATE = 105.50
+# ^ A constant, in ALL_CAPS by convention (signals "this never changes
+#   while the program runs"). Fixed per the assignment — not a live rate.
+
+RATING_WORDS = {"One": 1, "Two": 2, "Three": 3, "Four": 4, "Five": 5}
+# ^ A lookup table: given the text word, get the number. This is how we
+#   turn scraper.py's "Two" into an actual int(2) we can do math on.
+
+
+def parse_price(price_text: str) -> float | None:
+    try:
+        return float(price_text.replace("£", "").strip())
+        # ^ "£45.17" -> remove "£" -> "45.17" -> strip whitespace -> float(45.17)
+    except (ValueError, AttributeError):
+        # ^ If the text is something unexpected (e.g. empty, or not a number
+        #   at all), float() would crash the whole script. Catching the
+        #   error here means ONE bad row doesn't kill the entire pipeline.
+        return None
+        # ^ Returning None signals "couldn't parse this" — clean_books()
+        #   below checks for this and imputes the median in that case.
+
+
+def parse_rating(rating_word: str) -> int | None:
+    return RATING_WORDS.get(rating_word)
+    # ^ dict.get() returns the matching number, or None if the word isn't
+    #   found in the lookup table at all (e.g. unexpected text) — safer
+    #   than RATING_WORDS[rating_word], which would crash on a miss.
+
+
+def parse_availability(availability_text: str) -> bool | None:
+    text = availability_text.strip().lower()
+    if "in stock" in text:
+        return True
+    if "out of stock" in text:
+        return False
+    return None
+    # ^ Checks for the two known phrases; anything else (unexpected text)
+    #   returns None rather than guessing.
+
+
+def clean_books(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # ^ Work on a COPY, not the original DataFrame — avoids accidentally
+    #   modifying the caller's data (a common source of confusing bugs).
+
+    df["price_gbp"] = df["price"].apply(parse_price)
+    df["rating"] = df["star_rating"].apply(parse_rating)
+    df["in_stock"] = df["availability"].apply(parse_availability)
+    # ^ .apply(function) runs `function` on EVERY row's value in that column,
+    #   one at a time, and creates a new column from the results. This is
+    #   the pandas equivalent of writing a for-loop over every row.
+
+    before = len(df)
+    unparsed = df["rating"].isna() | df["in_stock"].isna()
+    # ^ .isna() gives True/False per row (True = this value is None/missing).
+    #   The `|` is "OR" — True if EITHER rating OR in_stock failed to parse.
+
+    if unparsed.any():
+        # ^ .any() checks: is there at least one True in that True/False series?
+        print(f"Dropping {unparsed.sum()} row(s) with unparseable rating/availability")
+        df = df[~unparsed]
+        # ^ `~` flips True/False (NOT). df[~unparsed] keeps only the rows
+        #   where unparsed was False — i.e. drops the bad ones.
+
+    missing_price = df["price_gbp"].isna()
+    if missing_price.any():
+        median_price = df["price_gbp"].median()
+        print(f"Imputing {missing_price.sum()} missing price(s) with median {median_price:.2f}")
+        df.loc[missing_price, "price_gbp"] = median_price
+        # ^ df.loc[condition, "column"] = value means "for only the rows
+        #   matching this condition, set this column to this value" —
+        #   fills in JUST the missing prices, leaves everything else untouched.
+
+    dropped = before - len(df)
+    print(f"Cleaning complete: {before} -> {len(df)} rows ({dropped} dropped)")
+
+    df["rating"] = df["rating"].astype(int)
+    df["in_stock"] = df["in_stock"].astype(bool)
+    # ^ .astype() forces the column's data type. Needed because after
+    #   dropping the NaN rows above, pandas still stores the column as a
+    #   generic "object" or float type — this locks it in as real int/bool.
+
+    df["price_inr"] = (df["price_gbp"] * GBP_TO_INR_RATE).round(2)
+    # ^ Simple multiplication, applied to the WHOLE column at once (no loop
+    #   needed) — this is "vectorized" pandas math. .round(2) keeps 2 decimals.
+
+    return df[["title", "price_gbp", "price_inr", "rating", "in_stock", "category"]]
+    # ^ Selects and reorders just these 6 columns for the final output —
+    #   drops the original messy "price"/"star_rating"/"availability" text
+    #   columns since we don't need them anymore.
+
+
+if __name__ == "__main__":
+    raw = pd.read_csv("data/books_raw.csv")
+    cleaned = clean_books(raw)
+    cleaned.to_csv("data/books_clean.csv", index=False, encoding="utf-8")
+    print(cleaned.head())
+    print(f"\nSaved {len(cleaned)} cleaned rows to data/books_clean.csv")
+```
+
+## Code Walkthrough: `build_database.py` (fully annotated)
+
+```python
+"""Builds a normalized SQLite database from the cleaned book data."""
+import sqlite3
+import pandas as pd
+
+DB_PATH = "data/zepto_books.db"
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS categories (
+    category_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category_name TEXT UNIQUE NOT NULL
+);
+CREATE TABLE IF NOT EXISTS books (
+    book_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    price_gbp REAL NOT NULL,
+    price_inr REAL NOT NULL,
+    rating INTEGER NOT NULL,
+    in_stock INTEGER NOT NULL,
+    category_id INTEGER NOT NULL,
+    FOREIGN KEY (category_id) REFERENCES categories(category_id)
+);
+"""
+# ^ Two tables. `categories` holds each unique category name ONCE.
+#   `books` holds one row per book, and instead of repeating the category
+#   NAME on every single book row, it stores just a category_id NUMBER
+#   that POINTS BACK to the categories table (the "FOREIGN KEY"). This is
+#   what "normalized" means — no duplicated text data across rows.
+
+
+def build_database(csv_path: str = "data/books_clean.csv", db_path: str = DB_PATH) -> None:
+    df = pd.read_csv(csv_path)
+
+    conn = sqlite3.connect(db_path)
+    # ^ Opens (or creates, if it doesn't exist yet) the .db file on disk.
+    cursor = conn.cursor()
+    # ^ The "cursor" is what you use to actually run SQL commands.
+
+    cursor.executescript("DROP TABLE IF EXISTS books; DROP TABLE IF EXISTS categories;")
+    cursor.executescript(SCHEMA)
+    # ^ Wipes any old tables first, then recreates them fresh — makes this
+    #   script safe to re-run from scratch any time, rather than erroring
+    #   out on "table already exists" or silently duplicating data.
+
+    category_ids = {}
+    # ^ A lookup: category NAME -> the auto-generated NUMBER SQLite gave it.
+    #   We need this because books.csv only has the category NAME as text,
+    #   but the books table needs the category_id NUMBER to link to it.
+
+    for category_name in df["category"].unique():
+        # ^ .unique() gives each distinct category name exactly once
+        #   (e.g. "Travel", "Mystery", "Historical Fiction" — not 69 times).
+        cursor.execute(
+            "INSERT INTO categories (category_name) VALUES (?)", (category_name,)
+        )
+        # ^ The "?" is a placeholder — sqlite3 safely inserts the actual
+        #   value in place of it. (Never build SQL by string-concatenating
+        #   values directly — that's how SQL-injection bugs happen.)
+        category_ids[category_name] = cursor.lastrowid
+        # ^ .lastrowid gives the auto-generated category_id SQLite just
+        #   assigned to the row we just inserted. We remember it here.
+
+    book_rows = [
+        (
+            row.title,
+            row.price_gbp,
+            row.price_inr,
+            int(row.rating),
+            int(bool(row.in_stock)),
+            category_ids[row.category],
+            # ^ Look up THIS book's category name in our dict from above,
+            #   to get the matching category_id number to store instead.
+        )
+        for row in df.itertuples()
+        # ^ .itertuples() walks through the DataFrame one row at a time,
+        #   letting us access each column as row.column_name.
+    ]
+    cursor.executemany(
+        """INSERT INTO books (title, price_gbp, price_inr, rating, in_stock, category_id)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        book_rows,
+    )
+    # ^ .executemany() runs the same INSERT statement once per tuple in
+    #   book_rows — much faster than calling .execute() 69 separate times.
+
+    conn.commit()
+    # ^ Without this, none of the inserts would actually be saved to disk —
+    #   SQLite (like most databases) requires an explicit "commit" to
+    #   make changes permanent.
+    print(f"Inserted {len(category_ids)} categories and {len(book_rows)} books into {db_path}")
+    conn.close()
+
+
+if __name__ == "__main__":
+    build_database()
+```
+
+## Code Walkthrough: `run_queries.py` (fully annotated)
+
+```python
+"""Runs the required SQL queries and cross-checks the JOIN with pandas."""
+import sqlite3
+import pandas as pd
+
+DB_PATH = "data/zepto_books.db"
+
+QUERIES = {
+    "1. SELECT/WHERE — in-stock books priced under £20": """
+        SELECT title, price_gbp, in_stock
+        FROM books
+        WHERE in_stock = 1 AND price_gbp < 20;
+    """,
+    # ^ ... 5 more queries follow this same {label: sql_string} pattern,
+    #   covering ORDER BY/LIMIT, DISTINCT, BETWEEN, IN, and a JOIN.
+    #   Storing them as a dict means run_all_queries() below can loop
+    #   over all of them generically instead of repeating code 6 times.
+}
+
+
+def run_all_queries(db_path: str = DB_PATH) -> dict[str, pd.DataFrame]:
+    conn = sqlite3.connect(db_path)
+    results = {}
+    for label, sql in QUERIES.items():
+        results[label] = pd.read_sql(sql, conn)
+        # ^ pd.read_sql runs the SQL AND returns the result directly as a
+        #   DataFrame — no separate cursor.execute() + fetchall() needed.
+    conn.close()
+    return results
+
+
+def cross_check_join(db_path: str = DB_PATH) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Reproduces the JOIN query two ways: pd.read_sql and pd.merge."""
+    conn = sqlite3.connect(db_path)
+
+    sql_result = pd.read_sql(
+        """SELECT c.category_name, b.title, b.rating
+           FROM books b JOIN categories c ON b.category_id = c.category_id
+           WHERE b.rating >= 4 ORDER BY c.category_name, b.rating DESC;""",
+        conn,
+    )
+    # ^ The SQL-based approach: the database itself does the joining.
+
+    books_df = pd.read_sql("SELECT * FROM books", conn)
+    categories_df = pd.read_sql("SELECT * FROM categories", conn)
+    conn.close()
+
+    merge_result = (
+        books_df.merge(categories_df, on="category_id")
+        # ^ pandas does the SAME join the database did, but in memory —
+        #   matches rows between the two tables wherever category_id agrees.
+        .query("rating >= 4")[["category_name", "title", "rating"]]
+        .sort_values(["category_name", "rating"], ascending=[True, False])
+        .reset_index(drop=True)
+        # ^ .reset_index(drop=True) renumbers rows 0,1,2,... after sorting —
+        #   needed so the two results can be compared row-for-row below.
+    )
+    sql_result = sql_result.reset_index(drop=True)
+
+    return sql_result, merge_result
+
+
+if __name__ == "__main__":
+    results = run_all_queries()
+    for label, df in results.items():
+        print(f"\n--- {label} ---")
+        print(df.to_string(index=False))
+
+    sql_result, merge_result = cross_check_join()
+    match = sql_result.equals(merge_result)
+    # ^ .equals() checks the two DataFrames are IDENTICAL — same values,
+    #   same order, same types. This is the actual proof the assignment
+    #   asks for: "SQL and pandas agree."
+    print(f"\nOutputs match: {match}")
+```
