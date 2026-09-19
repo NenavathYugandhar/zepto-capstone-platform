@@ -1,3 +1,4 @@
+
 # Zepto Data & AI Platform — Capstone
 
 An end-to-end AI/ML platform built as three internally-linked modules: a data-engineering
@@ -77,3 +78,7 @@ executed and verified live. `analytics` and `support_assistant` should be run on
 unrestricted machine (which is required anyway, to capture real metric values and real example
 API transcripts for submission) before final submission — see the note in
 [`support_assistant/README.md`](support_assistant/README.md) for specifics.
+=======
+# zepto-capstone-platform
+this is my IIT patna Capstone project 
+db82cd2a30a2d5121522ed57b158627c88d04ba0
